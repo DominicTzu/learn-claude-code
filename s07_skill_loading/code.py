@@ -23,10 +23,14 @@ Changes from s06:
   Loop unchanged: load_skill auto-dispatches via TOOL_HANDLERS.
 
 Run: python s07_skill_loading/code.py
-Needs: pip install anthropic python-dotenv pyyaml + ANTHROPIC_API_KEY in .env
+Needs: pip install openai python-dotenv pyyaml + .env 中配置 LLM_API_KEY、
+       LLM_BASE_URL 和 LLM_MODEL_ID（例如 DeepSeek 的 OpenAI 兼容接口）
 """
 
-import ast, json, os, subprocess
+import ast
+import json
+import os
+import subprocess
 from pathlib import Path
 import yaml
 
@@ -36,17 +40,22 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+if not os.getenv("LLM_API_KEY"):
+    raise RuntimeError("请在 .env 中设置 LLM_API_KEY")
+if not os.getenv("LLM_MODEL_ID"):
+    raise RuntimeError("请在 .env 中设置 LLM_MODEL_ID")
 
 WORKDIR = Path.cwd()
 SKILLS_DIR = WORKDIR / "skills"
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL") or None,
+)
+MODEL = os.environ["LLM_MODEL_ID"]
 CURRENT_TODOS: list[dict] = []
 
 # s07: Skill catalog scan (used by build_system below)
@@ -202,9 +211,7 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 def extract_text(content) -> str:
-    if not isinstance(content, list):
-        return str(content)
-    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
+    return content if isinstance(content, str) else ""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -212,16 +219,26 @@ def extract_text(content) -> str:
 # ═══════════════════════════════════════════════════════════
 
 SUB_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a shell command.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read file contents.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "write_file", "description": "Write content to a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "edit_file", "description": "Replace exact text in a file once.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]},
+    }},
+    {"type": "function", "function": {
+        "name": "glob", "description": "Find files matching a glob pattern.",
+        "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]},
+    }},
 ]
 SUB_HANDLERS = {"bash": run_bash, "read_file": run_read, "write_file": run_write,
                 "edit_file": run_edit, "glob": run_glob}
@@ -230,30 +247,41 @@ def spawn_subagent(description: str) -> str:
     print(f"\n\033[35m[Subagent spawned]\033[0m")
     messages = [{"role": "user", "content": description}]
     for _ in range(30):
-        response = client.messages.create(model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000)
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SUB_SYSTEM}, *messages],
+            tools=SUB_TOOLS,
+            max_tokens=8000,
+        )
+        assistant_message = response.choices[0].message
+        messages.append(assistant_message.model_dump(exclude_none=True))
+        if not assistant_message.tool_calls:
             break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                blocked = trigger_hooks("PreToolUse", block)
+        for tool_call in assistant_message.tool_calls:
+            name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as error:
+                output = f"Error: invalid tool arguments: {error}"
+            else:
+                blocked = trigger_hooks("PreToolUse", name, args)
                 if blocked:
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": str(blocked)})
-                    continue
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                trigger_hooks("PostToolUse", block, output)
-                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-        messages.append({"role": "user", "content": results})
-    result = extract_text(messages[-1]["content"])
+                    output = str(blocked)
+                else:
+                    handler = SUB_HANDLERS.get(name)
+                    output = handler(**args) if handler else f"Unknown: {name}"
+                    trigger_hooks("PostToolUse", name, args, output)
+                    print(f"  \033[90m[sub] {name}: {str(output)[:100]}\033[0m")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
+    result = extract_text(messages[-1].get("content"))
     if not result:
         for msg in reversed(messages):
             if msg["role"] == "assistant":
-                result = extract_text(msg["content"])
+                result = extract_text(msg.get("content"))
                 if result:
                     break
         if not result:
@@ -279,23 +307,38 @@ def load_skill(name: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
-     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
-    {"name": "task", "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
-    # s07: skill tool (catalog is already in SYSTEM prompt, this loads full content)
-    {"name": "load_skill", "description": "Load the full content of a skill by name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a shell command.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read file contents.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "write_file", "description": "Write content to a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "edit_file", "description": "Replace exact text in a file once.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]},
+    }},
+    {"type": "function", "function": {
+        "name": "glob", "description": "Find files matching a glob pattern.",
+        "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]},
+    }},
+    {"type": "function", "function": {
+        "name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+        "parameters": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]},
+    }},
+    {"type": "function", "function": {
+        "name": "task", "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+        "parameters": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
+    }},
+    {"type": "function", "function": {
+        "name": "load_skill", "description": "Load the full content of a skill by name.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
 ]
 
 TOOL_HANDLERS = {
@@ -323,16 +366,16 @@ def trigger_hooks(event: str, *args):
 
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 
-def permission_hook(block):
-    if block.name == "bash":
+def permission_hook(name: str, args: dict):
+    if name == "bash":
         for p in DENY_LIST:
-            if p in block.input.get("command", ""):
+            if p in args.get("command", ""):
                 print(f"\n\033[31m⛔ Blocked: '{p}'\033[0m")
                 return "Permission denied"
     return None
 
-def log_hook(block):
-    print(f"\033[90m[HOOK] {block.name}\033[0m")
+def log_hook(name: str, args: dict):
+    print(f"\033[90m[HOOK] {name}\033[0m")
     return None
 
 def context_inject_hook(query: str):
@@ -340,9 +383,7 @@ def context_inject_hook(query: str):
     return None
 
 def summary_hook(messages: list):
-    tool_count = sum(1 for m in messages
-                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    tool_count = sum(1 for message in messages if message.get("role") == "tool")
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
 
@@ -366,13 +407,15 @@ def agent_loop(messages: list):
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
             
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
             tools=TOOLS, max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        assistant_message = response.choices[0].message
+        messages.append(assistant_message.model_dump(exclude_none=True))
 
-        if response.stop_reason != "tool_use":
+        if not assistant_message.tool_calls:
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": force})
@@ -380,29 +423,28 @@ def agent_loop(messages: list):
             return
 
         rounds_since_todo += 1
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        for tool_call in assistant_message.tool_calls:
+            name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as error:
+                output = f"Error: invalid tool arguments: {error}"
+            else:
+                blocked = trigger_hooks("PreToolUse", name, args)
+                if blocked:
+                    output = str(blocked)
+                else:
+                    handler = TOOL_HANDLERS.get(name)
+                    output = handler(**args) if handler else f"Unknown: {name}"
+                    trigger_hooks("PostToolUse", name, args, output)
+                    if name == "todo_write":
+                        rounds_since_todo = 0
 
-            blocked = trigger_hooks("PreToolUse", block)
-            if blocked:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(blocked)})
-                continue
-
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
-
-            trigger_hooks("PostToolUse", block, output)
-
-            if block.name == "todo_write":
-                rounds_since_todo = 0
-
-            results.append({"type": "tool_result", "tool_use_id": block.id,
-                            "content": output})
-
-        messages.append({"role": "user", "content": results})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
 
 
 if __name__ == "__main__":
@@ -420,7 +462,7 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        response_content = history[-1].get("content")
+        if response_content:
+            print(response_content)
         print()

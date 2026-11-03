@@ -3,7 +3,8 @@
 s02: Tool Use — 在 s01 基础上新增 4 个工具 + 分发映射。
 
 运行: python s02_tool_use/code.py
-需要: pip install anthropic python-dotenv + .env 中配置 ANTHROPIC_API_KEY
+需要: pip install openai python-dotenv + .env 中配置 LLM_API_KEY、
+      LLM_BASE_URL 和 LLM_MODEL_ID（例如 DeepSeek 的 OpenAI 兼容接口）
 
 本文件 = s01 的全部代码 + 以下新增:
   + run_read / run_write / run_edit / run_glob 四个工具实现
@@ -13,28 +14,35 @@ s02: Tool Use — 在 s01 基础上新增 4 个工具 + 分发映射。
 循环本身（agent_loop）与 s01 完全一致。
 """
 
-import os, subprocess
+import json
+import os
+import subprocess
 from pathlib import Path
 
 try:
     import readline
-    readline.parse_and_bind('set bind-tty-special-chars off')
+    readline.parse_and_bind('set bind-tty-special-chars off') # 用于配置 readline 的行为，关闭特殊字符绑定
     readline.parse_and_bind('set input-meta on')
     readline.parse_and_bind('set output-meta on')
     readline.parse_and_bind('set convert-meta off')
 except ImportError:
     pass
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+if not os.getenv("LLM_API_KEY"):
+    raise RuntimeError("请在 .env 中设置 LLM_API_KEY")
+if not os.getenv("LLM_MODEL_ID"):
+    raise RuntimeError("请在 .env 中设置 LLM_MODEL_ID")
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(
+    api_key=os.getenv("LLM_API_KEY"),
+    base_url=os.getenv("LLM_BASE_URL") or None,
+)
+MODEL = os.environ["LLM_MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
@@ -63,18 +71,18 @@ def run_bash(command: str) -> str:
 #  NEW in s02: 4 个新工具
 # ═══════════════════════════════════════════════════════════
 
-def safe_path(p: str) -> Path:
+def safe_path(p: str) -> Path: # 安全路径校验，防止越界访问。但不能防止恶意代码写入文件，仍需谨慎使用。
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 
-def run_read(path: str, limit: int | None = None) -> str:
+def run_read(path: str, limit: int | None = None) -> str: # 读取文件内容，limit 限制行数；｜表示类型提示，表示 limit 可以是 int 或 None
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text().splitlines() # read_text() 是 Path 对象的方法，用于读取文件内容并返回字符串，splitlines() 将字符串按行分割成列表
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"] # 如果超过限制行数，则只显示前 limit 行，并提示还有多少行未显示
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
@@ -84,7 +92,7 @@ def run_write(path: str, content: str) -> str:
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        file_path.write_text(content) # write_text是Path对象的方法，用于将字符串写入文件
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -102,7 +110,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-def run_glob(pattern: str) -> str:
+def run_glob(pattern: str) -> str: # glob用于查找匹配的文件
     import glob as g
     try:
         results = []
@@ -119,16 +127,26 @@ def run_glob(pattern: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"type": "function", "function": {
+        "name": "bash", "description": "Run a shell command.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "Read file contents.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]},
+    }},
+    {"type": "function", "function": {
+        "name": "write_file", "description": "Write content to a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+    }},
+    {"type": "function", "function": {
+        "name": "edit_file", "description": "Replace exact text in a file once.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]},
+    }},
+    {"type": "function", "function": {
+        "name": "glob", "description": "Find files matching a glob pattern.",
+        "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]},
+    }},
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -138,7 +156,7 @@ TOOLS = [
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
-}
+} # 字典value是函数对象，key是工具名称，方便根据工具名称调用对应的函数。用key返回的函数对象可以直接调用，例如 TOOL_HANDLERS["bash"]("ls") 会调用 run_bash("ls")。
 
 
 # ═══════════════════════════════════════════════════════════
@@ -149,25 +167,35 @@ TOOL_HANDLERS = {
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create( # client.chat.completions.create 是 OpenAI API 的调用，用于生成聊天模型的响应
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
+            tools=TOOLS, # 模型会自动从可用工具中选择最合适的工具，放进 assistant_message.tool_calls 中
+            max_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        assistant_message = response.choices[0].message #.choices[0].message 是 OpenAI API 返回的响应中的第一个选择的消息对象，包含模型生成的内容和工具调用信息
+        messages.append(assistant_message.model_dump(exclude_none=True))
 
-        if response.stop_reason != "tool_use":
+        if not assistant_message.tool_calls:
             return
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m> {block.name}\033[0m")
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                print(str(output)[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        for tool_call in assistant_message.tool_calls: # tool_call 是一个对象，包含工具调用的详细信息，包括工具名称和参数
+            name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                output = f"Error: invalid tool arguments: {e}"
+            else:
+                print(f"\033[33m> {name}\033[0m")
+                handler = TOOL_HANDLERS.get(name)
+                output = handler(**args) if handler else f"Unknown: {name}"
 
-        messages.append({"role": "user", "content": results})
+            print(str(output)[:200])
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
 
 
 if __name__ == "__main__":
@@ -184,7 +212,7 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        response_content = history[-1].get("content")
+        if response_content:
+            print(response_content)
         print()

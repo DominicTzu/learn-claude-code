@@ -30,7 +30,7 @@ SYSTEM = (
 
 ![Skill Overview](images/skill-overview.svg)
 
-保留上一章的最小 hook 结构、`todo_write` 和子 Agent，本章重点转向新增的 `load_skill` 工具。启动时把技能目录注入 SYSTEM prompt，运行时多注册一个工具加载完整内容，用到才花 token。
+保留上一章的最小 hook 结构、`todo_write` 和子 Agent，本章重点转向新增的 `load_skill` 工具。启动时把技能目录注入 SYSTEM prompt，运行时多注册一个工具加载完整内容，用到才花 token。另有 `list_skills` 工具：当用户直接询问可用技能时，返回注册表中的完整清单，避免模型自行用文件工具猜测。
 
 两层设计：
 
@@ -108,7 +108,7 @@ def load_skill(name: str) -> str:
 
 | 组件 | 之前 (s06) | 之后 (s07) |
 |------|-----------|-----------|
-| 工具数量 | 7 (bash, read, write, edit, glob, todo_write, task) | 8 (+load_skill) |
+| 工具数量 | 7 (bash, read, write, edit, glob, todo_write, task) | 9 (+load_skill, list_skills) |
 | 知识加载 | 无 | 两级：启动时目录注入 SYSTEM + 运行时 load_skill；SKILL.md 可指引后续资源访问 |
 | SYSTEM 提示 | 静态字符串 | 启动时扫描 skills/ 注入目录 |
 | 技能注册表 | 无 | SKILL_REGISTRY（启动时填充，防路径遍历） |
@@ -129,7 +129,7 @@ python s07_skill_loading/code.py
 2. `Load the code-review skill and follow its instructions`
 3. `I need to do a code review -- load the relevant skill first`
 
-观察重点：Agent 是否直接从 SYSTEM 里的目录知道有哪些技能？需要完整规范时是否出现 `[HOOK] load_skill`？加载后回答是否使用了对应 skill 的说明？
+观察重点：询问可用技能时是否出现 `[HOOK] list_skills` 并列出完整清单？需要完整规范时是否出现 `[HOOK] load_skill`？加载后回答是否使用了对应 skill 的说明？
 
 ---
 

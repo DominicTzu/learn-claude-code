@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Design"
+  short_description: "Choose agent architecture and production safeguards"
+  default_prompt: "Use $design-agent to design a minimal, reliable agent for this use case."

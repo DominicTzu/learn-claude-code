@@ -139,7 +139,7 @@ cd learn-claude-code
 python s02_tool_use/code.py
 ```
 
-试试这些 prompt：
+试试这些 prompt： 
 
 1. `Read the file README.md and tell me what this project is about`
 2. `Create a file called test.py that prints "hello", then read it back`
