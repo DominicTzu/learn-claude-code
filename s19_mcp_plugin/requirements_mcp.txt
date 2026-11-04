@@ -1,0 +1,5 @@
+# Pin the classic ClientSession API used in this lesson, not SDK main/v2.
+mcp==1.30.0
+openai==2.44.0
+python-dotenv==1.2.2
+jsonschema>=4.20,<5
